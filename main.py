@@ -710,9 +710,13 @@ def download_youtube_video(url, output_dir="."):
         except Exception as e:
             print(f"⚠️ Failed to write cookies file: {e}")
             cookies_path = None
+    elif os.path.exists(cookies_path) and os.path.getsize(cookies_path) > 0:
+        # Fork: a cookies.txt dropped in the repo root (bind-mounted to /app)
+        # works without squeezing multi-line cookies into an env var.
+        print(f"🍪 Using existing cookies file. Size: {os.path.getsize(cookies_path)} bytes")
     else:
         cookies_path = None
-        print("⚠️ YOUTUBE_COOKIES env var not found.")
+        print("⚠️ No YOUTUBE_COOKIES env var and no cookies.txt file.")
     
     # Optional HTTP proxy. Set PROXY_URL to route downloads through it; unset
     # (self-host) goes direct as before.
