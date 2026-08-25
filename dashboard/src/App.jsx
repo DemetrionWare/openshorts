@@ -683,7 +683,9 @@ function App() {
 
   // Hosted is paid-only (no BYOK core). Self-host uses BYOK keys.
   // `keysMissing` now means "self-host BYOK keys missing" — it never fires on hosted.
-  const keysMissing = !billingEnabled && (!apiKey || !uploadPostKey);
+  // Fork: only Gemini is required. Upload-Post powers the optional publish
+  // button, not the pipeline, so its absence must not block clip generation.
+  const keysMissing = !billingEnabled && !apiKey;
   const needsPlan = billingEnabled && !isManaged;   // hosted, signed-out or no active plan/trial
 
   // Fresh sign-up: show the welcome plan-choice popup once (AuthContext set the
