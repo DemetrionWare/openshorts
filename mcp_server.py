@@ -68,6 +68,12 @@ TOOLS = [
                     "type": "string",
                     "description": "Public video URL (YouTube or a direct video file URL).",
                 },
+                "source_path": {
+                    "type": "string",
+                    "description": "Self-host only: a video file already on the server, "
+                                   "under incoming/ or uploads/ (e.g. 'incoming/talk.mp4'). "
+                                   "Provide exactly one of source_url / source_path.",
+                },
                 "confirm_rights": {
                     "type": "boolean",
                     "description": "Must be true: the user owns the content or has rights to process it.",
@@ -110,7 +116,7 @@ TOOLS = [
                     "description": "Maximum clip length in seconds (default 60). Must be ≥ 5s above the minimum.",
                 },
             },
-            "required": ["source_url", "confirm_rights"],
+            "required": ["confirm_rights"],
         },
     },
     {
@@ -283,8 +289,11 @@ async def _tool_process_video(client, args):
     if not args.get("confirm_rights"):
         return {"error": "confirm_rights must be true: the user must own the "
                          "content or hold the rights to process it."}, True
+    if bool(args.get("source_url")) == bool(args.get("source_path")):
+        return {"error": "Provide exactly one of source_url or source_path."}, True
     body = {
-        "url": args["source_url"],
+        "url": args.get("source_url"),
+        "source_path": args.get("source_path"),
         "acknowledged": True,
         "layouts": args.get("layouts") or [],
         "output_format": args.get("output_format"),

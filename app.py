@@ -1926,6 +1926,7 @@ async def process_endpoint(
     request: Request,
     file: Optional[UploadFile] = File(None),
     url: Optional[str] = Form(None),
+    source_path: Optional[str] = Form(None),
     acknowledged: Optional[str] = Form(None),
     output_format: Optional[str] = Form(None),
     layouts: Optional[str] = Form(None),
@@ -1951,6 +1952,7 @@ async def process_endpoint(
     if "application/json" in content_type:
         body = await request.json()
         url = body.get("url")
+        source_path = body.get("source_path")
         ack_flag = bool(body.get("acknowledged"))
         force_low = bool(body.get("force_low_quality"))
         output_format = body.get("output_format")
@@ -1987,7 +1989,26 @@ async def process_endpoint(
         if not src or not os.path.exists(src):
             raise HTTPException(status_code=404, detail="Source video for this session is no longer on disk")
 
-    if not url and not file and not thumb_session:
+    # Fork: process a file already on this machine (self-host only — never
+    # exposed under billing, where users must not reach server paths). The
+    # path must resolve inside incoming/ or uploads/; nothing else on the box
+    # is reachable through this argument.
+    local_src = None
+    if source_path:
+        if BILLING_ENABLED:
+            raise HTTPException(status_code=400, detail="source_path is self-host only")
+        if url or file or thumb_session:
+            raise HTTPException(status_code=400, detail="Provide only one source")
+        allowed = [os.path.realpath("incoming"), os.path.realpath(UPLOAD_DIR)]
+        cand = os.path.realpath(source_path)
+        if not any(cand == root or cand.startswith(root + os.sep) for root in allowed):
+            raise HTTPException(status_code=400,
+                                detail="source_path must live under incoming/ or uploads/")
+        if not os.path.isfile(cand):
+            raise HTTPException(status_code=404, detail=f"No file at {source_path}")
+        local_src = cand
+
+    if not url and not file and not thumb_session and not local_src:
         raise HTTPException(status_code=400, detail="Must provide URL or File")
 
     # Completion callback: reject unsafe targets NOW (clear 400) — delivery
@@ -2042,7 +2063,7 @@ async def process_endpoint(
         "ip": client_ip,
         "user_agent": user_agent,
         "timestamp": time.time(),
-        "source": "thumbnail_session" if thumb_session else ("url" if url else "file"),
+        "source": "local_path" if local_src else ("thumbnail_session" if thumb_session else ("url" if url else "file")),
     }
 
     job_id = str(uuid.uuid4())
@@ -2144,6 +2165,20 @@ async def process_endpoint(
             with open(transcript_path, "w") as f:
                 json.dump(thumb_session["transcript"], f)
             cmd.extend(["--transcript", transcript_path])
+    elif local_src:
+        # Fork (source_path): treat a file already on disk exactly like an
+        # upload — hardlink it under the job's name so retention ages out the
+        # link while the original stays where the owner put it.
+        src_duration = _media_duration_seconds(local_src)
+        if MIN_SOURCE_SECONDS > 0 and 0 < src_duration < MIN_SOURCE_SECONDS:
+            shutil.rmtree(job_output_dir, ignore_errors=True)
+            _reject_short_source(src_duration)
+        input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{os.path.basename(local_src)}")
+        try:
+            os.link(local_src, input_path)
+        except OSError:
+            shutil.copyfile(local_src, input_path)
+        cmd.extend(["-i", input_path])
     else:
         # Save uploaded file with size limit check.
         # basename() strips any path components from the client-supplied
