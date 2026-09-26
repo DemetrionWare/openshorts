@@ -748,7 +748,10 @@ def download_youtube_video(url, output_dir="."):
     elif _bgutil_script:
         hd_args = {'youtubepot-bgutilscript': {'script_path': [_bgutil_script]}}
     else:
-        hd_args = None
+        # No PO-token provider: still try HD with yt-dlp's default clients.
+        # With a JS runtime (node/deno) they reach 1080p where the fallback
+        # client list below only gets format 18 (360p).
+        hd_args = {}
     fallback_args = {
         'youtube': {
             'player_client': ['tv_embed', 'android', 'mweb', 'web'],
@@ -781,6 +784,9 @@ def download_youtube_video(url, output_dir="."):
             'proxy': proxy, 'socket_timeout': 30, 'retries': 10, 'fragment_retries': 10,
             'nocheckcertificate': True, 'cachedir': False,
             'extractor_args': extractor_args,
+            # yt-dlp only enables deno by default; node lets it solve YouTube's
+            # JS challenges on hosts that only have Node installed.
+            'js_runtimes': {'deno': {}, 'node': {}},
             'http_headers': {
                 'User-Agent': (
                     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
@@ -830,7 +836,7 @@ def download_youtube_video(url, output_dir="."):
          fallback_fmt if label == 'fallback' else _hd_fmt_for(capped),
          proxy)
         for label, capped, proxy in plan_download_attempts(
-            _direct_first, _statics, _proxy, bool(hd_args))
+            _direct_first, _statics, _proxy, hd_args is not None)
     ]
 
     sanitized_title = None
