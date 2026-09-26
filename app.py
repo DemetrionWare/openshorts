@@ -39,7 +39,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Configuration
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
-MAX_FILE_SIZE_MB = 3072  # 3GB limit — owner uploads run to 2GB+ sources
+MAX_FILE_SIZE_MB = int(os.getenv("MAX_FILE_SIZE_MB", "3072"))  # 3GB default — owner uploads run to 2GB+ sources
 
 # How TikTok receives our uploads. MEDIA_UPLOAD lands the video in the user's
 # TikTok drafts so they finish the post inside TikTok's own editor; DIRECT_POST
@@ -2190,14 +2190,19 @@ async def process_endpoint(
         size = 0
         limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
 
+        too_large = False
         with open(input_path, "wb") as buffer:
             while content := await file.read(1024 * 1024): # Read 1MB chunks
                 size += len(content)
                 if size > limit_bytes:
-                    os.remove(input_path)
-                    shutil.rmtree(job_output_dir)
-                    raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
+                    too_large = True
+                    break
                 buffer.write(content)
+        # Remove only after the handle is closed: Windows can't delete an open file
+        if too_large:
+            os.remove(input_path)
+            shutil.rmtree(job_output_dir, ignore_errors=True)
+            raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
 
         upload_duration = _media_duration_seconds(input_path)
         if MIN_SOURCE_SECONDS > 0 and 0 < upload_duration < MIN_SOURCE_SECONDS:
