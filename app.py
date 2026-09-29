@@ -3489,6 +3489,200 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# --- Reframe only: one clip in, the same clip reframed to 9:16 out ---
+#
+# For callers that already cut their own clip and only want the speaker-tracking
+# reframe (reframe_v2.render): no job, no transcript, no Gemini, no clip
+# selection. Self-host only (it is unmetered compute).
+#
+# The render runs in a child process of this same Python, not in the server
+# process, for two reasons:
+#   - its own log lines are the only record of which scene engine ran
+#     (scene_detection falls back from TransNetV2 to PySceneDetect on any error)
+#     and which encoder ran (ffmpeg_utils falls back from h264_nvenc to libx264).
+#     A child's stdout belongs to this one render, so those lines can be read
+#     back exactly; in-process prints from concurrent jobs would interleave, and
+#     the encoder line is only printed once per process.
+#   - it keeps the ML stack (YOLO, MediaPipe, TransNetV2) out of the server.
+# The response reports both facts; the caller decides whether a fallback is
+# acceptable. Nothing here falls back.
+
+REFRAME_ASPECT = 9 / 16
+REFRAME_TIMEOUT_SECONDS = 1800
+# Reframes run one at a time by default: each loads YOLO, MediaPipe and TransNetV2 on the GPU,
+# so many callers at once must queue, not pile up. A dedicated semaphore (not the job queue's
+# concurrency_semaphore) so a burst of reframes never takes the slots full /api/process jobs use,
+# and so its size is about GPU model loads, not about pipeline jobs. A call that has to wait waits.
+REFRAME_MAX_CONCURRENT = max(int(os.environ.get("REFRAME_MAX_CONCURRENT", "1")), 1)
+reframe_semaphore = asyncio.Semaphore(REFRAME_MAX_CONCURRENT)
+_REFRAME_CHILD = "import sys, reframe_v2; reframe_v2.render(sys.argv[1], sys.argv[2], 9 / 16)"
+_REFRAME_ENCODER_RE = re.compile(r"\[Encoder\] video encoder: (\S+)")
+
+
+def _probe_video(path: str) -> dict:
+    """width, height, duration and whether there is an audio stream, via ffprobe.
+    Raises RuntimeError when the file has no video stream or can't be probed."""
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "stream=codec_type,width,height:format=duration", "-of", "json", path],
+        capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or f"ffprobe exited {proc.returncode}")
+    info = json.loads(proc.stdout)
+    if "streams" not in info or "format" not in info or "duration" not in info["format"]:
+        raise RuntimeError(f"ffprobe gave no streams/duration: {proc.stdout.strip()[:300]}")
+    streams = info["streams"]
+    video = [st for st in streams if st["codec_type"] == "video"]
+    if not video:
+        raise RuntimeError("no video stream")
+    return {
+        "width": int(video[0]["width"]),
+        "height": int(video[0]["height"]),
+        "duration": float(info["format"]["duration"]),
+        "has_audio": any(st["codec_type"] == "audio" for st in streams),
+    }
+
+
+def _reframe_signals(log_text: str) -> dict:
+    """Which scene engine and which video encoder the render used, read from the
+    render's own log lines (scene_detection.detect_scenes and
+    ffmpeg_utils.video_encode_args). Raises RuntimeError if either is missing."""
+    if "Scene engine: TransNetV2" in log_text:
+        scene_engine = "transnetv2"
+    elif "falling back to PySceneDetect" in log_text or \
+            os.environ.get("SCENE_ENGINE", "").strip().lower() == "pyscenedetect":
+        scene_engine = "pyscenedetect"
+    else:
+        raise RuntimeError("the render log does not say which scene engine ran")
+    m = _REFRAME_ENCODER_RE.search(log_text)
+    if not m:
+        raise RuntimeError("the render log does not say which video encoder ran")
+    return {"scene_engine": scene_engine, "video_encoder": m.group(1)}
+
+
+def _run_reframe_child(input_path: str, output_path: str) -> str:
+    """Run reframe_v2.render in a child process; return its combined log.
+    Raises RuntimeError (with the log tail) when the render fails."""
+    env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    # ultralytics checks for internet (DNS) at import unless told it is offline
+    env["YOLO_OFFLINE"] = "true"
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _REFRAME_CHILD, input_path, output_path],
+            cwd=os.path.dirname(os.path.abspath(__file__)), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=REFRAME_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as e:
+        # the captured output is bytes here even in text mode (subprocess docs)
+        out = e.output or b""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", errors="replace")
+        tail = "\n".join(out.strip().splitlines()[-40:])
+        raise RuntimeError(f"reframe timed out after {REFRAME_TIMEOUT_SECONDS}s:\n{tail}")
+    if proc.returncode != 0:
+        tail = "\n".join(proc.stdout.strip().splitlines()[-40:])
+        raise RuntimeError(f"reframe failed (exit {proc.returncode}):\n{tail}")
+    return proc.stdout
+
+
+@app.post("/api/reframe")
+async def reframe_only(request: Request, file: UploadFile = File(...)):
+    """Reframe one uploaded clip to 9:16 with speaker tracking.
+
+    Request: multipart/form-data with one field, ``file`` (the clip).
+    Response: the reframed file's absolute ``output_path`` and ``video_url``
+    (under /videos), its ``width``/``height``/``duration``/``has_audio``, the
+    ``scene_engine`` ("transnetv2" or "pyscenedetect") and ``video_encoder``
+    ("h264_nvenc" or "libx264") the render used, its ``layout_ranges`` and
+    ``render_seconds``. The output folder ages out like a job folder.
+    """
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=403, detail="/api/reframe is self-host only")
+
+    reframe_id = f"reframe_{uuid.uuid4().hex[:12]}"
+    safe_name = os.path.basename(file.filename or "") or "clip.mp4"
+    stem = os.path.splitext(safe_name)[0] or "clip"
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    input_path = os.path.abspath(os.path.join(UPLOAD_DIR, f"{reframe_id}_{safe_name}"))
+    out_dir = os.path.abspath(os.path.join(OUTPUT_DIR, reframe_id))
+    out_name = f"{stem}_9x16.mp4"
+    output_path = os.path.join(out_dir, out_name)
+
+    try:
+        size = 0
+        limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+        too_large = False
+        with open(input_path, "wb") as buffer:
+            while content := await file.read(1024 * 1024):
+                size += len(content)
+                if size > limit_bytes:
+                    too_large = True
+                    break
+                buffer.write(content)
+        if too_large:
+            raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
+        if size == 0:
+            raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+        try:
+            source = _probe_video(input_path)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Not a readable video: {e}")
+
+        os.makedirs(out_dir, exist_ok=True)
+        loop = asyncio.get_event_loop()
+        if reframe_semaphore.locked():
+            print(f"⏳ Reframe {reframe_id}: waiting for a free reframe slot ({REFRAME_MAX_CONCURRENT} at a time)")
+        async with reframe_semaphore:
+            started = time.time()
+            try:
+                log_text = await loop.run_in_executor(None, _run_reframe_child, input_path, output_path)
+                signals = _reframe_signals(log_text)
+                if not os.path.isfile(output_path):
+                    raise RuntimeError(f"the render finished but wrote no file at {output_path}")
+                result = _probe_video(output_path)
+                # The sidecar is for OpenShorts' own caption pass; its contents travel
+                # in the response instead, so the folder holds only the video.
+                sidecar = layout_ranges.sidecar_path(output_path)
+                if not os.path.isfile(sidecar):
+                    raise RuntimeError(f"the render finished but wrote no layout sidecar at {sidecar}")
+                ranges = layout_ranges.read(output_path)
+                if not ranges:
+                    raise RuntimeError(f"the layout sidecar {sidecar} has no ranges")
+                os.remove(sidecar)
+            except Exception as e:
+                shutil.rmtree(out_dir, ignore_errors=True)
+                print(f"Reframe Error: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+            render_seconds = round(time.time() - started, 1)
+
+        print(f"🎯 Reframe {reframe_id}: {safe_name} -> {out_name} | {result['width']}x{result['height']}, "
+              f"{result['duration']:.2f}s | scene engine {signals['scene_engine']}, encoder {signals['video_encoder']} | "
+              f"layout " + ", ".join(f"{r['start']:.2f}-{r['end']:.2f} {r['layout']}" for r in ranges)
+              + f" | {render_seconds}s")
+
+        return {
+            "output_path": output_path,
+            "video_url": f"/videos/{reframe_id}/{out_name}",
+            "width": result["width"],
+            "height": result["height"],
+            "duration": result["duration"],
+            "has_audio": result["has_audio"],
+            "source": source,
+            "scene_engine": signals["scene_engine"],
+            "video_encoder": signals["video_encoder"],
+            "layout_ranges": ranges,
+            "render_seconds": render_seconds,
+        }
+    finally:
+        try:
+            os.remove(input_path)
+        except OSError:
+            pass
+
+
 # --- Remotion Render Proxy ---
 RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", "http://renderer:3100")
 
