@@ -3683,6 +3683,354 @@ async def reframe_only(request: Request, file: UploadFile = File(...)):
             pass
 
 
+# --- Captions only: one video + its caption words in, the captioned video out ---
+#
+# For callers that already have the exact words and times for a whole video: no
+# job, no transcription, no Gemini. The words are burned as sent, through the
+# same karaoke path the subtitle editor uses (generate_ass, then burn_subtitles).
+# Self-host only (it is unmetered compute).
+#
+# generate_ass quietly clamps numbers and swaps bad colors, positions and font
+# names for defaults, and its block collector drops empty words and glues words
+# that lack a leading space. So every field is required and checked here first:
+# a bad value is a 400, never a silent substitute.
+#
+# The burn runs in a child process with ffmpeg's report (FFREPORT) switched on
+# for that child only. The report is this one render's own record of the
+# encoder ffmpeg actually used (ffmpeg_utils falls back from h264_nvenc to
+# libx264, and says so only once per process) and of the font libass actually
+# picked (libass quietly uses another font when the named one is missing, and
+# for any character the font lacks). The response reports the encoder; the
+# caller decides whether libx264 is acceptable. A font substitution is a 400.
+# Nothing here falls back.
+
+from urllib.parse import quote as _url_quote
+from ffmpeg_utils import escape_filter_value as _ffmpeg_escape
+
+CAPTIONS_TIMEOUT_SECONDS = 1800
+# One burn at a time by default: each is a full-video NVENC encode, and consumer
+# GPUs cap concurrent NVENC sessions. Its own semaphore, like reframe's.
+CAPTIONS_MAX_CONCURRENT = max(int(os.environ.get("CAPTIONS_MAX_CONCURRENT", "1")), 1)
+captions_semaphore = asyncio.Semaphore(CAPTIONS_MAX_CONCURRENT)
+CAPTION_POSITIONS = ("top", "middle", "bottom")
+CAPTION_EFFECTS = ("none", "glow", "pop", "box")
+_CAPTION_HEX_RE = re.compile(r"#[0-9A-Fa-f]{6}")
+_CAPTION_FONT_RE = re.compile(r"[A-Za-z0-9_-]+( [A-Za-z0-9_-]+)*")
+# video_encode_args runs (and caches) the NVENC probe before FFREPORT is set, so
+# the report holds the burn alone, not the probe's test encode.
+_CAPTIONS_CHILD = (
+    "import os, sys, ffmpeg_utils, subtitles\n"
+    "ffmpeg_utils.video_encode_args(ffmpeg_utils.QUALITY)\n"
+    "os.environ['FFREPORT'] = sys.argv[4]\n"
+    "subtitles.burn_subtitles(sys.argv[1], sys.argv[2], sys.argv[3])\n"
+)
+_FFREPORT_ENCODER_RE = re.compile(r"Stream #\d+:\d+ -> #\d+:\d+ \(.*? -> h264 \((\w+)\)\)")
+_FFREPORT_FONT_RE = re.compile(r"fontselect: \((.+?), \d+, \d+\) -> ([^,\s]+), ")
+_FFREPORT_GLYPH_RE = re.compile(r"Glyph 0x([0-9A-Fa-f]+) not found")
+_ASS_EVENT_RE = re.compile(
+    r"^Dialogue: \d+,(\d+):(\d\d):(\d\d)\.(\d\d),(\d+):(\d\d):(\d\d)\.(\d\d),", re.M)
+
+
+def _parse_caption_words(raw: str) -> list:
+    """The ``words`` form field -> [{'text', 'start', 'end'}], checked.
+    Raises ValueError naming the first bad word."""
+    try:
+        words = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"words is not valid JSON: {e}")
+    if not isinstance(words, list) or not words:
+        raise ValueError("words must be a non-empty JSON array")
+    out = []
+    for i, w in enumerate(words):
+        if not isinstance(w, dict) or set(w) != {"text", "start", "end"}:
+            raise ValueError(f"word {i} must be an object with exactly the keys text, start, end; "
+                             f"got {json.dumps(w)[:200]}")
+        text, start, end = w["text"], w["start"], w["end"]
+        if not isinstance(text, str) or not text or " ".join(text.split()) != text:
+            raise ValueError(f"word {i} text {text!r} must be a non-empty string with no leading, "
+                             f"trailing or repeated whitespace")
+        if any(c in text for c in "{}\\"):
+            raise ValueError(f"word {i} text {text!r} contains {{, }} or \\ (ASS control characters)")
+        for key, val in (("start", start), ("end", end)):
+            if isinstance(val, bool) or not isinstance(val, (int, float)) or not math.isfinite(val):
+                raise ValueError(f"word {i} ({text!r}) {key} must be a number of seconds, got {val!r}")
+        if not 0 <= start < end:
+            raise ValueError(f"word {i} ({text!r}) needs 0 <= start < end, got start {start}, end {end}")
+        if out and start <= out[-1]["start"]:
+            raise ValueError(f"word {i} ({text!r}) starts at {start}, not after word {i - 1}'s "
+                             f"start {out[-1]['start']}")
+        out.append({"text": text, "start": float(start), "end": float(end)})
+    return out
+
+
+def _check_caption_style(*, position, margin_v, font_name, font_size, font_color, border_color,
+                         border_width, style, highlight_color, effect, base_opacity,
+                         bg_color, bg_opacity, max_chars, max_duration) -> None:
+    """Refuse any value generate_ass would clamp, swap or ignore. Raises ValueError
+    listing every problem."""
+    problems = []
+    if style != "karaoke":
+        problems.append(f"style must be 'karaoke' (the only path that honors margin_v and "
+                        f"uppercase), got {style!r}")
+    if position not in CAPTION_POSITIONS:
+        problems.append(f"position must be one of {', '.join(CAPTION_POSITIONS)}, got {position!r}")
+    if effect not in CAPTION_EFFECTS:
+        problems.append(f"effect must be one of {', '.join(CAPTION_EFFECTS)}, got {effect!r}")
+    if not _CAPTION_FONT_RE.fullmatch(font_name):
+        problems.append(f"font_name must be letters, digits, _ or - words separated by single "
+                        f"spaces, got {font_name!r}")
+    for name, value in (("font_color", font_color), ("border_color", border_color),
+                        ("highlight_color", highlight_color), ("bg_color", bg_color)):
+        if not _CAPTION_HEX_RE.fullmatch(value):
+            problems.append(f"{name} must be #RRGGBB, got {value!r}")
+    # font_size below 12 would be raised: the ASS size is int(font_size * 0.85), floored at 10.
+    for name, value, lo, hi in (("margin_v", margin_v, 0, 200), ("font_size", font_size, 12, 200),
+                                ("border_width", border_width, 1, 10),
+                                ("base_opacity", base_opacity, 0.05, 1.0),
+                                ("bg_opacity", bg_opacity, 0.0, 1.0)):
+        if not lo <= value <= hi:
+            problems.append(f"{name} must be between {lo} and {hi}, got {value!r}")
+    if max_chars < 1:
+        problems.append(f"max_chars must be at least 1, got {max_chars!r}")
+    if not (math.isfinite(max_duration) and max_duration > 0):
+        problems.append(f"max_duration must be a number of seconds above 0, got {max_duration!r}")
+    if problems:
+        raise ValueError("; ".join(problems))
+
+
+def _check_caption_events(ass_path: str, words: list) -> None:
+    """generate_ass writes one event per word, back to back; ASS keeps times in
+    1/100 s. Raises ValueError for a word that would show for 0 s after that
+    rounding, RuntimeError if the event count does not match the words."""
+    with open(ass_path, encoding="utf-8-sig") as f:
+        events = _ASS_EVENT_RE.findall(f.read())
+    if len(events) != len(words):
+        raise RuntimeError(f"generate_ass wrote {len(events)} caption events for {len(words)} words")
+    for i, ev in enumerate(events):
+        h1, m1, s1, c1, h2, m2, s2, c2 = (int(x) for x in ev)
+        if (h2 * 3600 + m2 * 60 + s2) * 100 + c2 <= (h1 * 3600 + m1 * 60 + s1) * 100 + c1:
+            raise ValueError(f"word {i} ({words[i]['text']!r}) would show for 0 s once times are "
+                             f"rounded to 1/100 s (the ASS format); give it at least 0.01 s")
+
+
+def _font_is_family(family: str, face: str) -> bool:
+    """libass reports the face it picked by its internal (PostScript) name, e.g.
+    Anton -> Anton-Regular, Liberation Sans -> LiberationSans-Bold."""
+    want = re.sub(r"[^a-z0-9]", "", family.lower())
+    return re.sub(r"[^a-z0-9]", "", face.lower()).startswith(want)
+
+
+def _captions_signals(report_text: str, font_name: str) -> dict:
+    """The encoder ffmpeg used and the font face(s) libass picked, read from
+    ffmpeg's report of one burn. RuntimeError if the report does not say;
+    ValueError (the caller's input) if libass used another font or lacked a glyph."""
+    m = _FFREPORT_ENCODER_RE.search(report_text)
+    if not m:
+        raise RuntimeError("ffmpeg's report does not say which video encoder ran")
+    faces = sorted({face for _, face in _FFREPORT_FONT_RE.findall(report_text)})
+    if not faces:
+        raise RuntimeError("ffmpeg's report does not say which font libass used")
+    problems = []
+    others = [f for f in faces if not _font_is_family(font_name, f)]
+    if others:
+        problems.append(f"font_name {font_name!r} was not used as asked: libass rendered with "
+                        f"{', '.join(others)} (is the font installed or in openshorts/fonts?)")
+    glyphs = sorted({int(h, 16) for h in _FFREPORT_GLYPH_RE.findall(report_text)})
+    if glyphs:
+        problems.append(f"font {font_name!r} has no glyph for "
+                        + ", ".join(f"U+{g:04X} ({chr(g)})" for g in glyphs)
+                        + " used in the words; libass drew them in another font")
+    if problems:
+        raise ValueError("; ".join(problems))
+    return {"video_encoder": m.group(1), "font": ", ".join(faces)}
+
+
+def _run_captions_child(input_path: str, ass_path: str, output_path: str, report_path: str) -> str:
+    """Run subtitles.burn_subtitles in a child process with ffmpeg's report
+    written to report_path; return the child's combined log.
+    Raises RuntimeError (with the log tail) when the burn fails."""
+    env = dict(os.environ)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    report = f"file={_ffmpeg_escape(report_path)}:level=32"
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-c", _CAPTIONS_CHILD, input_path, ass_path, output_path, report],
+            cwd=os.path.dirname(os.path.abspath(__file__)), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=CAPTIONS_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as e:
+        # the captured output is bytes here even in text mode (subprocess docs)
+        out = e.output or b""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", errors="replace")
+        tail = "\n".join(out.strip().splitlines()[-40:])
+        raise RuntimeError(f"caption burn timed out after {CAPTIONS_TIMEOUT_SECONDS}s:\n{tail}")
+    if proc.returncode != 0:
+        tail = "\n".join(proc.stdout.strip().splitlines()[-40:])
+        raise RuntimeError(f"caption burn failed (exit {proc.returncode}):\n{tail}")
+    return proc.stdout
+
+
+@app.post("/api/captions")
+async def captions_only(
+    file: UploadFile = File(...),
+    words: str = Form(...),
+    position: str = Form(...),
+    margin_v: int = Form(...),
+    font_name: str = Form(...),
+    font_size: int = Form(...),
+    font_color: str = Form(...),
+    border_color: str = Form(...),
+    border_width: int = Form(...),
+    style: str = Form(...),
+    highlight_color: str = Form(...),
+    effect: str = Form(...),
+    base_opacity: float = Form(...),
+    uppercase: bool = Form(...),
+    bg_color: str = Form(...),
+    bg_opacity: float = Form(...),
+    max_chars: int = Form(...),
+    max_duration: float = Form(...),
+):
+    """Burn karaoke captions onto one uploaded video.
+
+    Request: multipart/form-data. ``file`` (the video), ``words`` (JSON array of
+    {"text", "start", "end"}, seconds from the video's start, burned verbatim)
+    and every style field; all required, none defaulted. The full contract is
+    reaction-video-pipeline/docs/handoffs/captions-api-contract.md.
+    Response: the captioned file's absolute ``output_path`` and ``video_url``
+    (under /videos), its ``width``/``height``/``duration``/``has_audio``, the
+    upload's ``source`` probe, the ``video_encoder`` and ``font`` the render
+    used, ``word_count`` and ``render_seconds``. The output folder ages out
+    like a job folder.
+    """
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=403, detail="/api/captions is self-host only")
+    try:
+        caption_words = _parse_caption_words(words)
+        _check_caption_style(
+            position=position, margin_v=margin_v, font_name=font_name, font_size=font_size,
+            font_color=font_color, border_color=border_color, border_width=border_width,
+            style=style, highlight_color=highlight_color, effect=effect,
+            base_opacity=base_opacity, bg_color=bg_color, bg_opacity=bg_opacity,
+            max_chars=max_chars, max_duration=max_duration)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    captions_id = f"captions_{uuid.uuid4().hex[:12]}"
+    safe_name = os.path.basename(file.filename or "") or "video.mp4"
+    stem = os.path.splitext(safe_name)[0] or "video"
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    input_path = os.path.abspath(os.path.join(UPLOAD_DIR, f"{captions_id}_{safe_name}"))
+    out_dir = os.path.abspath(os.path.join(OUTPUT_DIR, captions_id))
+    out_name = f"{stem}_captions.mp4"
+    output_path = os.path.join(out_dir, out_name)
+    # Neutral names: these two paths go inside ffmpeg option strings, where an
+    # apostrophe from a video title cannot be escaped (ffmpeg_utils.escape_filter_value).
+    ass_path = os.path.join(out_dir, "captions.ass")
+    report_path = os.path.join(out_dir, "ffmpeg_report.log")
+
+    try:
+        size = 0
+        limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
+        too_large = False
+        with open(input_path, "wb") as buffer:
+            while content := await file.read(1024 * 1024):
+                size += len(content)
+                if size > limit_bytes:
+                    too_large = True
+                    break
+                buffer.write(content)
+        if too_large:
+            raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
+        if size == 0:
+            raise HTTPException(status_code=400, detail="The uploaded file is empty.")
+        try:
+            source = _probe_video(input_path)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Not a readable video: {e}")
+        late = [i for i, w in enumerate(caption_words) if w["start"] >= source["duration"]]
+        if late:
+            w = caption_words[late[0]]
+            raise HTTPException(status_code=400, detail=(
+                f"{len(late)} word(s) start at or after the video's end ({source['duration']:.3f}s), "
+                f"first: word {late[0]} ({w['text']!r}) at {w['start']}"))
+
+        os.makedirs(out_dir, exist_ok=True)
+        try:
+            # Leading space = Whisper's word-boundary convention; without it the
+            # block collector glues each word onto the one before.
+            transcript = {"segments": [{"words": [
+                {"word": " " + w["text"], "start": w["start"], "end": w["end"]} for w in caption_words]}]}
+            if not generate_ass(transcript, 0.0, source["duration"], ass_path,
+                                max_chars=max_chars, max_duration=max_duration, alignment=position,
+                                fontsize=font_size, font_name=font_name, font_color=font_color,
+                                border_color=border_color, border_width=border_width,
+                                highlight_color=highlight_color, bg_color=bg_color,
+                                bg_opacity=bg_opacity, effect=effect, base_opacity=base_opacity,
+                                uppercase=uppercase, margin_v=margin_v):
+                raise RuntimeError("generate_ass wrote no caption events")
+            _check_caption_events(ass_path, caption_words)
+        except ValueError as e:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            shutil.rmtree(out_dir, ignore_errors=True)
+            print(f"Captions Error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+        loop = asyncio.get_event_loop()
+        if captions_semaphore.locked():
+            print(f"⏳ Captions {captions_id}: waiting for a free caption slot ({CAPTIONS_MAX_CONCURRENT} at a time)")
+        async with captions_semaphore:
+            started = time.time()
+            try:
+                await loop.run_in_executor(
+                    None, _run_captions_child, input_path, ass_path, output_path, report_path)
+                if not os.path.isfile(output_path):
+                    raise RuntimeError(f"the burn finished but wrote no file at {output_path}")
+                with open(report_path, encoding="utf-8", errors="replace") as f:
+                    signals = _captions_signals(f.read(), font_name)
+                result = _probe_video(output_path)
+            except ValueError as e:
+                shutil.rmtree(out_dir, ignore_errors=True)
+                print(f"Captions Error: {e}")
+                raise HTTPException(status_code=400, detail=str(e))
+            except Exception as e:
+                shutil.rmtree(out_dir, ignore_errors=True)
+                print(f"Captions Error: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
+            render_seconds = round(time.time() - started, 1)
+        # The folder holds only the video.
+        os.remove(ass_path)
+        os.remove(report_path)
+
+        print(f"💬 Captions {captions_id}: {safe_name} -> {out_name} | {result['width']}x{result['height']}, "
+              f"{result['duration']:.2f}s | {len(caption_words)} words | encoder {signals['video_encoder']}, "
+              f"font {signals['font']} | {render_seconds}s")
+
+        return {
+            "output_path": output_path,
+            "video_url": f"/videos/{captions_id}/{_url_quote(out_name)}",
+            "width": result["width"],
+            "height": result["height"],
+            "duration": result["duration"],
+            "has_audio": result["has_audio"],
+            "source": source,
+            "video_encoder": signals["video_encoder"],
+            "font": signals["font"],
+            "word_count": len(caption_words),
+            "render_seconds": render_seconds,
+        }
+    finally:
+        try:
+            os.remove(input_path)
+        except OSError:
+            pass
+
+
 # --- Remotion Render Proxy ---
 RENDER_SERVICE_URL = os.getenv("RENDER_SERVICE_URL", "http://renderer:3100")
 
